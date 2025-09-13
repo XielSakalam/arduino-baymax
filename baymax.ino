@@ -1,5 +1,12 @@
 #include <EEPROM.h>
+#include <SoftwareSerial.h>
 
+// ===== BLUETOOTH SETUP =====
+const int BLUETOOTH_RX_PIN = 10;  // Connect to HC-05 TX
+const int BLUETOOTH_TX_PIN = 11;  // Connect to HC-05 RX hindi ko kasi alam saan yung pin nya pero use nyo pin 10 at 11
+SoftwareSerial ralphBluetooth(BLUETOOTH_RX_PIN, BLUETOOTH_TX_PIN);
+
+// ===== PIN DEFINITIONS =====
 const int VIBRATION_PIN = 2;
 const int SOUND_SENSOR_PIN = 8;
 const int MOTION_PIN = 6;
@@ -12,6 +19,7 @@ const int IR_VCC_PIN = 42;
 const int IR_SIGNAL_PIN = 43;
 const int IR_GND_PIN = 44;
 
+// ===== TIMING CONSTANTS =====
 const unsigned long VIBRATION_DEBOUNCE = 10;  
 const unsigned long MOTION_DEBOUNCE = 50;      
 const unsigned long SOUND_DEBOUNCE = 30;      
@@ -20,6 +28,7 @@ const unsigned long ULTRASONIC_READ_INTERVAL = 500;
 const unsigned long IR_READ_INTERVAL = 200;      
 const unsigned long STATS_DISPLAY_INTERVAL = 30000;
 const unsigned long CALIBRATION_TIME = 50000; // 50 secs calibrating 
+const unsigned long BLUETOOTH_SEND_INTERVAL = 5000; // Send data every 5 seconds
 
 // ===== ULTRASONIC CONSTANTS =====
 const float SOUND_SPEED = 0.0343; 
@@ -27,6 +36,7 @@ const int MAX_DISTANCE = 1000;
 const int MIN_DISTANCE = 1;
 const int PROXIMITY_THRESHOLD = 50;
 
+// ===== CO2 SENSOR CONSTANTS =====
 const unsigned char CO2_CMD_READ[] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
 const unsigned char CO2_CMD_CALIBRATE[] = {0xFF, 0x01, 0x87, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78};
 const int CO2_RESPONSE_LENGTH = 9;
@@ -44,10 +54,10 @@ const int IR_BASELINE_SAMPLES = 50;
 const int IR_DETECTION_SAMPLES = 5;  
 
 // ===== SOUND SENSITIVITY CONSTANTS =====
-const int SOUND_THRESHOLD = 300;    // LOWER SINSI SOUND // 2000 orgi
+const int SOUND_THRESHOLD = 300;    
 const int SOUND_MIN_DURATION = 20;      
 
-const int VIBRATION_CONSECUTIVE_HITS = 2; // SENSI VIB
+const int VIBRATION_CONSECUTIVE_HITS = 2;
 
 // ===== EEPROM ADDRESSES =====
 const int EEPROM_INIT_FLAG = 0;
@@ -56,6 +66,11 @@ const int EEPROM_SOUND_COUNT = 8;
 const int EEPROM_MOTION_COUNT = 12;
 const int EEPROM_PROXIMITY_COUNT = 16;
 const int EEPROM_LIFE_COUNT = 20;
+
+// ===== BLUETOOTH SETTINGS =====
+bool ralphBluetoothEnabled = true;
+bool ralphBluetoothAutoSend = true;
+unsigned long ralphLastBluetoothSend = 0;
 
 struct SensorState {
   volatile bool ralphVibrationFlag = false;
@@ -112,7 +127,6 @@ struct SensorData {
   float ralphMinDistance = MAX_DISTANCE;
   float ralphMaxDistance = 0.0;
   
-  // Infrared data
   int ralphCurrentIRValue = 0;
   int ralphMaxIRValue = 0;
   int ralphMinIRValue = 1023;
@@ -126,8 +140,12 @@ SensorData ralphieData;
 unsigned char ralphCO2Response[CO2_RESPONSE_LENGTH];
 
 void setup() {
-  Serial.begin(9600); // BAUFU
-  Serial1.begin(9600);
+  Serial.begin(9600);
+  Serial1.begin(9600);  // CO2 sensor
+  
+  // Initialize Bluetooth
+  ralphBluetooth.begin(9600);
+  ralphInitializeBluetooth();
   
   pinMode(VIBRATION_PIN, INPUT_PULLUP);
   pinMode(SOUND_SENSOR_PIN, INPUT);
@@ -138,7 +156,7 @@ void setup() {
   pinMode(ULTRASONIC_ECHO_PIN, INPUT);
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
   
-  // Ralph's IR sensor setup - importante to
+  // Ralph's IR sensor setup
   pinMode(IR_VCC_PIN, OUTPUT);
   pinMode(IR_GND_PIN, OUTPUT);
   pinMode(IR_SIGNAL_PIN, INPUT);
@@ -148,11 +166,10 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(VIBRATION_PIN), ralphVibrationISR, CHANGE);
   
   ralphLoadDataFromEEPROM();
-
   ralphDisplayStartupMessage();
+  ralphSendBluetoothMessage("SYSTEM_STARTUP", "BAYMAX Environmental Monitor v3.0 Online");
   
   ralphInitializeIRBaseline();
-  
   ralphStartCalibration();
 }
 
@@ -164,7 +181,7 @@ void loop() {
   ralphHandleSoundSensor(ralphCurrentTime);
   ralphHandleMotionSensor(ralphCurrentTime);
   
-  // Read CO2 - importante to
+  // Read CO2
   if (ralphCurrentTime - ralphieState.ralphLastCO2Time >= CO2_READ_INTERVAL) {
     ralphHandleCO2Sensor();
     ralphieState.ralphLastCO2Time = ralphCurrentTime;
@@ -190,7 +207,16 @@ void loop() {
     ralphHandleCalibration(ralphCurrentTime);
   }
   
-  // Update status LED - visual lang to
+  // Handle Bluetooth communication
+  ralphHandleBluetoothCommunication(ralphCurrentTime);
+  
+  // Auto-send data via Bluetooth
+  if (ralphBluetoothAutoSend && ralphBluetoothEnabled && 
+      (ralphCurrentTime - ralphLastBluetoothSend >= BLUETOOTH_SEND_INTERVAL)) {
+    ralphSendBluetoothData();
+    ralphLastBluetoothSend = ralphCurrentTime;
+  }
+  
   ralphUpdateStatusLED();
 
   if (Serial.available()) {
@@ -198,6 +224,289 @@ void loop() {
   }
   
   delay(20);
+}
+
+// ===== BLUETOOTH FUNCTIONS =====
+void ralphInitializeBluetooth() {
+  Serial.println(F("📡 Initializing Bluetooth..."));
+  delay(1000);
+  
+  // Test Bluetooth connection
+  ralphBluetooth.println(F("AT"));
+  delay(500);
+  
+  if (ralphBluetooth.available()) {
+    String response = ralphBluetooth.readString();
+    if (response.indexOf("OK") >= 0) {
+      Serial.println(F("✅ Bluetooth module detected"));
+      ralphBluetoothEnabled = true;
+    } else {
+      Serial.println(F("⚠️  Bluetooth module not responding properly"));
+    }
+  } else {
+    Serial.println(F("⚠️  Bluetooth module not found - continuing without BT"));
+    ralphBluetoothEnabled = false;
+  }
+  
+  if (ralphBluetoothEnabled) {
+    // Set device name
+    ralphBluetooth.println(F("AT+NAME=BAYMAX_Monitor"));
+    delay(500);
+    
+    // Set PIN
+    ralphBluetooth.println(F("AT+PSWD=1234"));
+    delay(500);
+    
+    Serial.println(F("📡 Bluetooth configured: Device=BAYMAX_Monitor, PIN=1234"));
+  }
+  Serial.println();
+}
+
+void ralphHandleBluetoothCommunication(unsigned long ralphCurrentTime) {
+  if (!ralphBluetoothEnabled) return;
+  
+  if (ralphBluetooth.available()) {
+    String ralphCommand = ralphBluetooth.readStringUntil('\n');
+    ralphCommand.trim();
+    ralphCommand.toLowerCase();
+    
+    Serial.print(F("📱 BT Command: "));
+    Serial.println(ralphCommand);
+    
+    if (ralphCommand == "stats") {
+      ralphSendBluetoothStats();
+    } else if (ralphCommand == "data") {
+      ralphSendBluetoothData();
+    } else if (ralphCommand == "reset") {
+      ralphResetCounters();
+      ralphSendBluetoothMessage("RESET", "All counters reset");
+    } else if (ralphCommand == "calibrate") {
+      ralphStartCalibration();
+      ralphSendBluetoothMessage("CALIBRATION", "CO2 calibration started");
+    } else if (ralphCommand == "distance") {
+      float ralphDist = ralphReadUltrasonicDistance();
+      String ralphDistMsg = "Distance: " + String(ralphDist, 1) + " cm";
+      ralphSendBluetoothMessage("DISTANCE", ralphDistMsg);
+    } else if (ralphCommand == "co2") {
+      String ralphCO2Msg = "CO2: " + String(ralphieData.ralphCurrentCO2) + " ppm";
+      ralphSendBluetoothMessage("CO2", ralphCO2Msg);
+    } else if (ralphCommand == "ir" || ralphCommand == "infrared") {
+      String ralphIRMsg = "IR: " + String(ralphieData.ralphCurrentIRValue) + 
+                         " (Life: " + (ralphieState.ralphLifeDetected ? "YES" : "NO") + ")";
+      ralphSendBluetoothMessage("INFRARED", ralphIRMsg);
+    } else if (ralphCommand == "autosend on") {
+      ralphBluetoothAutoSend = true;
+      ralphSendBluetoothMessage("AUTOSEND", "Auto-send enabled");
+    } else if (ralphCommand == "autosend off") {
+      ralphBluetoothAutoSend = false;
+      ralphSendBluetoothMessage("AUTOSEND", "Auto-send disabled");
+    } else if (ralphCommand == "help") {
+      ralphSendBluetoothHelp();
+    } else if (ralphCommand == "ping") {
+      ralphSendBluetoothMessage("PONG", "System online");
+    } else {
+      ralphSendBluetoothMessage("ERROR", "Unknown command. Send 'help' for commands.");
+    }
+  }
+}
+
+void ralphSendBluetoothMessage(String ralphType, String ralphMessage) {
+  if (!ralphBluetoothEnabled) return;
+  
+  unsigned long ralphUptime = millis() / 1000;
+  
+  ralphBluetooth.print(F("["));
+  ralphBluetooth.print(ralphUptime);
+  ralphBluetooth.print(F("] "));
+  ralphBluetooth.print(ralphType);
+  ralphBluetooth.print(F(": "));
+  ralphBluetooth.println(ralphMessage);
+}
+
+void ralphSendBluetoothData() {
+  if (!ralphBluetoothEnabled) return;
+
+  ralphBluetooth.println(F("{"));
+  ralphBluetooth.print(F("  \"uptime\": "));
+  ralphBluetooth.print(millis() / 1000);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"vibrations\": "));
+  ralphBluetooth.print(ralphieData.ralphVibCount);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"sounds\": "));
+  ralphBluetooth.print(ralphieData.ralphSoundCount);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"motion\": "));
+  ralphBluetooth.print(ralphieData.ralphMotionCount);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"proximity\": "));
+  ralphBluetooth.print(ralphieData.ralphProximityCount);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"life_detections\": "));
+  ralphBluetooth.print(ralphieData.ralphLifeCount);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"co2_ppm\": "));
+  ralphBluetooth.print(ralphieData.ralphCurrentCO2);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"co2_avg\": "));
+  ralphBluetooth.print(ralphieData.ralphAvgCO2, 1);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"distance_cm\": "));
+  ralphBluetooth.print(ralphieData.ralphCurrentDistance, 1);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"ir_value\": "));
+  ralphBluetooth.print(ralphieData.ralphCurrentIRValue);
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"life_detected\": "));
+  ralphBluetooth.print(ralphieState.ralphLifeDetected ? F("true") : F("false"));
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"motion_active\": "));
+  ralphBluetooth.print(ralphieState.ralphMotionState == HIGH ? F("true") : F("false"));
+  ralphBluetooth.println(F(","));
+  
+  ralphBluetooth.print(F("  \"proximity_detected\": "));
+  ralphBluetooth.print(ralphieState.ralphProximityDetected ? F("true") : F("false"));
+  ralphBluetooth.println();
+  
+  ralphBluetooth.println(F("}"));
+}
+
+void ralphSendBluetoothStats() {
+  if (!ralphBluetoothEnabled) return;
+  
+  unsigned long ralphUptimeSeconds = millis() / 1000;
+  unsigned long ralphHours = ralphUptimeSeconds / 3600;
+  unsigned long ralphMinutes = (ralphUptimeSeconds % 3600) / 60;
+  unsigned long ralphSeconds = ralphUptimeSeconds % 60;
+  
+  ralphBluetooth.println(F("=== BAYMAX STATISTICS ==="));
+  ralphBluetooth.print(F("Uptime: "));
+  ralphBluetooth.print(ralphHours);
+  ralphBluetooth.print(F("h "));
+  ralphBluetooth.print(ralphMinutes);
+  ralphBluetooth.print(F("m "));
+  ralphBluetooth.print(ralphSeconds);
+  ralphBluetooth.println(F("s"));
+  
+  ralphBluetooth.print(F("Vibrations: "));
+  ralphBluetooth.println(ralphieData.ralphVibCount);
+  
+  ralphBluetooth.print(F("Sounds: "));
+  ralphBluetooth.println(ralphieData.ralphSoundCount);
+  
+  ralphBluetooth.print(F("Motion Events: "));
+  ralphBluetooth.println(ralphieData.ralphMotionCount);
+  
+  ralphBluetooth.print(F("Proximity Events: "));
+  ralphBluetooth.println(ralphieData.ralphProximityCount);
+  
+  ralphBluetooth.print(F("Life Detections: "));
+  ralphBluetooth.println(ralphieData.ralphLifeCount);
+  
+  if (ralphieData.ralphTotalCO2Readings > 0) {
+    ralphBluetooth.print(F("CO2 Current: "));
+    ralphBluetooth.print(ralphieData.ralphCurrentCO2);
+    ralphBluetooth.println(F(" ppm"));
+    
+    ralphBluetooth.print(F("CO2 Average: "));
+    ralphBluetooth.print(ralphieData.ralphAvgCO2, 1);
+    ralphBluetooth.println(F(" ppm"));
+  }
+  
+  ralphBluetooth.print(F("Distance: "));
+  ralphBluetooth.print(ralphieData.ralphCurrentDistance, 1);
+  ralphBluetooth.println(F(" cm"));
+  
+  ralphBluetooth.println(F("========================"));
+}
+
+void ralphSendBluetoothHelp() {
+  if (!ralphBluetoothEnabled) return;
+  
+  ralphBluetooth.println(F("=== BAYMAX BT COMMANDS ==="));
+  ralphBluetooth.println(F("stats - Show statistics"));
+  ralphBluetooth.println(F("data - Get JSON data"));
+  ralphBluetooth.println(F("reset - Reset counters"));
+  ralphBluetooth.println(F("calibrate - Calibrate CO2"));
+  ralphBluetooth.println(F("distance - Current distance"));
+  ralphBluetooth.println(F("co2 - Current CO2 level"));
+  ralphBluetooth.println(F("ir - Infrared sensor info"));
+  ralphBluetooth.println(F("autosend on/off - Toggle auto data"));
+  ralphBluetooth.println(F("ping - Test connection"));
+  ralphBluetooth.println(F("help - This help menu"));
+  ralphBluetooth.println(F("========================="));
+}
+
+// ===== ENHANCED EVENT NOTIFICATIONS =====
+void ralphDisplayVibrationAlert() {
+  Serial.print(F("🔴 VIBRATION ["));
+  Serial.print(ralphieData.ralphVibCount);
+  Serial.print(F("] │ "));
+  ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("VIBRATION", "Vibration detected #" + String(ralphieData.ralphVibCount));
+}
+
+void ralphDisplaySoundAlert(int ralphSoundLevel) {
+  Serial.print(F("🔊 SOUND ["));
+  Serial.print(ralphieData.ralphSoundCount);
+  Serial.print(F("] │ Level: "));
+  Serial.print(ralphSoundLevel);
+  Serial.print(F(" │ "));
+  ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("SOUND", "Sound detected #" + String(ralphieData.ralphSoundCount) + 
+                           " Level:" + String(ralphSoundLevel));
+}
+
+void ralphDisplayMotionStart() {
+  Serial.print(F("🚶 MOTION START ["));
+  Serial.print(ralphieData.ralphMotionCount);
+  Serial.print(F("] │ "));
+  ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("MOTION_START", "Motion detected #" + String(ralphieData.ralphMotionCount));
+}
+
+void ralphDisplayProximityAlert(float ralphDistance) {
+  Serial.print(F("👤 PROXIMITY ["));
+  Serial.print(ralphieData.ralphProximityCount);
+  Serial.print(F("] │ Distance: "));
+  Serial.print(ralphDistance, 1);
+  Serial.print(F(" cm │ "));
+  ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("PROXIMITY", "Object detected at " + String(ralphDistance, 1) + "cm");
+}
+
+void ralphDisplayLifeDetection(const char* ralphLifeType, int ralphIRValue, int ralphDifference) {
+  Serial.print(F("🔥 LIFE DETECTED: "));
+  Serial.print(ralphLifeType);
+  Serial.print(F(" │ IR: "));
+  Serial.print(ralphIRValue);
+  Serial.print(F(" (diff: "));
+  Serial.print(ralphDifference);
+  Serial.print(F(") │ "));
+  ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("LIFE_DETECTION", String(ralphLifeType) + " detected! #" + 
+                           String(ralphieData.ralphLifeCount));
 }
 
 // ===== INFRARED SENSOR FUNCTIONS =====
@@ -231,7 +540,7 @@ void ralphHandleInfraredSensor() {
   // Calculate difference from baseline
   int ralphIRDifference = abs(ralphIRValue - ralphieState.ralphIRBaseline);
   
-  // Check for life detection - important detection to
+  // Check for life detection
   if (ralphIRDifference > IR_LIFE_THRESHOLD) {
     ralphieState.ralphIRDetectionCount++;
     
@@ -335,6 +644,13 @@ void ralphHandleCO2Sensor() {
       
       ralphUpdateCO2Statistics(ralphPPM);
       ralphDisplayCO2Reading(ralphFilteredPPM, ralphPPM); 
+      
+      // Send critical CO2 alerts via Bluetooth
+      if (ralphFilteredPPM > CO2_CRITICAL_LEVEL) {
+        ralphSendBluetoothMessage("CO2_CRITICAL", "DANGER! CO2 Level: " + String(ralphFilteredPPM) + " ppm");
+      } else if (ralphFilteredPPM > CO2_HIGH_LEVEL) {
+        ralphSendBluetoothMessage("CO2_HIGH", "HIGH CO2 Level: " + String(ralphFilteredPPM) + " ppm");
+      }
     } else {
       ralphDisplayCO2Error("Invalid reading");
     }
@@ -358,7 +674,7 @@ void ralphAddCO2ToBuffer(int ralphPPM) {
 
 int ralphGetFilteredCO2() {
   if (!ralphieState.ralphCO2BufferFull && ralphieState.ralphCO2BufferIndex == 0) {
-    return ralphieState.ralphCO2Buffer[0]; // hindi pa sure CO2 ralph
+    return ralphieState.ralphCO2Buffer[0];
   }
   
   int ralphCount = ralphieState.ralphCO2BufferFull ? 5 : ralphieState.ralphCO2BufferIndex;
@@ -371,15 +687,14 @@ int ralphGetFilteredCO2() {
   return ralphSum / ralphCount;
 }
 
-// ===== ENHANCED DISPLAY FUNCTIONS =====
 void ralphDisplayStartupMessage() {
   Serial.println(F("\n╔══════════════════════════════════════╗"));
   Serial.println(F("║      BAYMAX ENVIRONMENTAL MONITOR    ║"));
-  Serial.println(F("║            Version 3.0               ║"));
+  Serial.println(F("║       SIP GRADE 12 STEM MATALINO     ║"));
   Serial.println(F("╠══════════════════════════════════════╣"));
   Serial.println(F("║ Sensors: Vibration, Sound, Motion   ║"));
   Serial.println(F("║    CO2, Distance, Infrared Heat     ║"));
-  Serial.println(F("║         LIFE DETECTION ENABLED      ║"));
+  Serial.println(F("║      LIFE DETECTION,  BLUETOOTH     ║"));
   Serial.println(F("╚══════════════════════════════════════╝"));
   Serial.println();
   
@@ -396,25 +711,10 @@ void ralphDisplayStartupMessage() {
   Serial.println();
 }
 
-void ralphDisplaySoundAlert(int ralphSoundLevel) {
-  Serial.print(F("🔊 SOUND ["));
-  Serial.print(ralphieData.ralphSoundCount);
-  Serial.print(F("] │ Level: "));
-  Serial.print(ralphSoundLevel);
-  Serial.print(F(" │ "));
-  ralphDisplayTimestamp();
-}
-
 void ralphDisplaySoundEnd(unsigned long ralphDuration) {
   Serial.print(F("🔇 SOUND END │ Duration: "));
   Serial.print(ralphDuration);
   Serial.print(F("ms │ "));
-  ralphDisplayTimestamp();
-}
-
-void ralphDisplayLifeDetection(const char* ralphLifeType, int ralphIRValue, int ralphDifference) {
-  Serial.print(F("life detected."));
-  Serial.print(F(" │ "));
   ralphDisplayTimestamp();
 }
 
@@ -424,10 +724,23 @@ void ralphDisplayLifeDetectionEnd() {
   Serial.print(ralphDuration / 1000.0, 1);
   Serial.print(F("s │ "));
   ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("LIFE_END", "Life detection ended. Duration: " + String(ralphDuration / 1000.0, 1) + "s");
+}
+
+void ralphDisplayMotionEnd(unsigned long ralphDuration) {
+  Serial.print(F("⏹️  MOTION END │ Duration: "));
+  Serial.print(ralphDuration / 1000.0, 1);
+  Serial.print(F("s │ "));
+  ralphDisplayTimestamp();
+  
+  // Send Bluetooth notification
+  ralphSendBluetoothMessage("MOTION_END", "Motion ended. Duration: " + String(ralphDuration / 1000.0, 1) + "s");
 }
 
 void ralphDisplayCO2Reading(int ralphFilteredPPM, int ralphRawPPM) {
-  Serial.print(F("🌬️  CO2 READING [")); // co2 co2 ni ralph
+  Serial.print(F("🌬️  CO2 READING ["));
   Serial.print(ralphieData.ralphTotalCO2Readings);
   Serial.print(F("] │ Filtered: "));
   Serial.print(ralphFilteredPPM);
@@ -441,7 +754,7 @@ void ralphDisplayCO2Reading(int ralphFilteredPPM, int ralphRawPPM) {
   
   Serial.print(F(" │ "));
   
-  // Air quality indicator - importante to
+  // Air quality indicator
   if (ralphFilteredPPM <= CO2_NORMAL_LEVEL) {
     Serial.print(F("✅ EXCELLENT"));
   } else if (ralphFilteredPPM <= CO2_ELEVATED_LEVEL) {
@@ -465,7 +778,7 @@ void ralphDisplayCO2Error(const char* ralphErrorType) {
   ralphDisplayTimestamp();
 }
 
-// ===== ULTRASONIC SENSOR FUNCTIONS (Same as before) =====
+// ===== ULTRASONIC SENSOR FUNCTIONS =====
 float ralphReadUltrasonicDistance() {
   digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -520,6 +833,23 @@ void ralphHandleUltrasonicSensor() {
   }
 }
 
+void ralphDisplayDistanceReading(float ralphDistance) {
+  Serial.print(F("📏 DISTANCE: "));
+  Serial.print(ralphDistance, 1);
+  Serial.print(F(" cm │ "));
+  ralphDisplayTimestamp();
+}
+
+void ralphDisplayProximityEnd(unsigned long ralphDuration) {
+  Serial.print(F("👤 PROXIMITY END │ Duration: "));
+  Serial.print(ralphDuration / 1000.0, 1);
+  Serial.print(F("s │ "));
+  ralphDisplayTimestamp();
+  
+  // Send bluetooth //
+  ralphSendBluetoothMessage("PROXIMITY_END", "Object left. Duration: " + String(ralphDuration / 1000.0, 1) + "s");
+}
+
 // ===== REMAINING FUNCTIONS (CO2, Calibration, etc.) =====
 void ralphSendCO2Command(const unsigned char* ralphCommand) {
   Serial1.write(ralphCommand, CO2_RESPONSE_LENGTH);
@@ -565,7 +895,6 @@ void ralphUpdateCO2Statistics(int ralphPPM) {
   if (ralphPPM > ralphieData.ralphMaxCO2) ralphieData.ralphMaxCO2 = ralphPPM;
 }
 
-// ===== IMPROVED VIBRATION INTERRUPT =====
 void ralphVibrationISR() {
   static unsigned long ralphLastInterrupt = 0;
   unsigned long ralphCurrentTime = millis();
@@ -608,14 +937,20 @@ void ralphHandleCalibration(unsigned long ralphCurrentTime) {
 void ralphDisplayCalibrationStart() {
   Serial.println(F("🔧 CALIBRATION MODE STARTED"));
   Serial.println(F("   Please ensure sensor is in clean air..."));
-  Serial.println(F("   Calibration will take 30 seconds"));
+  Serial.println(F("   Calibration will take 50 seconds"));
   Serial.println();
+  
+  ralphSendBluetoothMessage("CALIBRATION_START", "CO2 calibration started - 50 seconds");
 }
 
 void ralphDisplayCalibrationProgress(int ralphProgress) {
   Serial.print(F("🔧 Calibration Progress: "));
   Serial.print(ralphProgress);
   Serial.println(F("%"));
+  
+  if (ralphProgress % 10 == 0) {
+    ralphSendBluetoothMessage("CALIBRATION_PROGRESS", "Calibration: " + String(ralphProgress) + "%");
+  }
 }
 
 void ralphDisplayCalibrationComplete() {
@@ -623,51 +958,8 @@ void ralphDisplayCalibrationComplete() {
   Serial.println(F("   CO2 sensor calibrated to 400ppm"));
   Serial.println(F("   System ready for monitoring"));
   Serial.println();
-}
-
-// ===== DISPLAY FUNCTIONS =====
-void ralphDisplayVibrationAlert() {
-  Serial.print(F("🔴 VIBRATION ["));
-  Serial.print(ralphieData.ralphVibCount);
-  Serial.print(F("] │ "));
-  ralphDisplayTimestamp();
-}
-
-void ralphDisplayMotionStart() {
-  Serial.print(F("🚶 MOTION START ["));
-  Serial.print(ralphieData.ralphMotionCount);
-  Serial.print(F("] │ "));
-  ralphDisplayTimestamp();
-}
-
-void ralphDisplayMotionEnd(unsigned long ralphDuration) {
-  Serial.print(F("⏹️  MOTION END │ Duration: "));
-  Serial.print(ralphDuration / 1000.0, 1);
-  Serial.print(F("s │ "));
-  ralphDisplayTimestamp();
-}
-
-void ralphDisplayDistanceReading(float ralphDistance) {
-  Serial.print(F("📏 DISTANCE: "));
-  Serial.print(ralphDistance, 1);
-  Serial.print(F(" cm │ "));
-  ralphDisplayTimestamp();
-}
-
-void ralphDisplayProximityAlert(float ralphDistance) {
-  Serial.print(F("👤 PROXIMITY ["));
-  Serial.print(ralphieData.ralphProximityCount);
-  Serial.print(F("] │ Distance: "));
-  Serial.print(ralphDistance, 1);
-  Serial.print(F(" cm │ "));
-  ralphDisplayTimestamp();
-}
-
-void ralphDisplayProximityEnd(unsigned long ralphDuration) {
-  Serial.print(F("👤 PROXIMITY END │ Duration: "));
-  Serial.print(ralphDuration / 1000.0, 1);
-  Serial.print(F("s │ "));
-  ralphDisplayTimestamp();
+  
+  ralphSendBluetoothMessage("CALIBRATION_COMPLETE", "CO2 sensor calibrated successfully");
 }
 
 void ralphDisplayStatistics() {
@@ -685,6 +977,11 @@ void ralphDisplayStatistics() {
   Serial.print(F("m "));
   Serial.print(ralphSeconds);
   Serial.println(F("s"));
+  
+  Serial.print(F("📡 Bluetooth: "));
+  Serial.print(ralphBluetoothEnabled ? F("ENABLED") : F("DISABLED"));
+  Serial.print(F(" │ Auto-send: "));
+  Serial.println(ralphBluetoothAutoSend ? F("ON") : F("OFF"));
   
   Serial.print(F("🔴 Vibrations: "));
   Serial.print(ralphieData.ralphVibCount);
@@ -748,7 +1045,6 @@ void ralphDisplayTimestamp() {
   Serial.println(ralphSeconds);
 }
 
-// ===== EEPROM FUNCTIONS =====
 void ralphLoadDataFromEEPROM() {
   if (EEPROM.read(EEPROM_INIT_FLAG) == 0xAA) {
     EEPROM.get(EEPROM_VIBRATION_COUNT, ralphieData.ralphVibCount);
@@ -770,12 +1066,11 @@ void ralphSaveDataToEEPROM() {
   EEPROM.put(EEPROM_LIFE_COUNT, ralphieData.ralphLifeCount);
 }
 
-// ===== STATUS LED AND SERIAL FUNCTIONS =====
 void ralphUpdateStatusLED() {
   static unsigned long ralphLastBlink = 0;
   static bool ralphLedState = false;
   
-  unsigned long ralphBlinkRate = 1000; //  1 second
+  unsigned long ralphBlinkRate = 1000; // 1 second
 
   if (ralphieState.ralphCalibrating) {
     ralphBlinkRate = 250;
@@ -785,6 +1080,9 @@ void ralphUpdateStatusLED() {
   }
   else if (ralphieState.ralphMotionState == HIGH) {
     ralphBlinkRate = 500;
+  }
+  else if (!ralphBluetoothEnabled) {
+    ralphBlinkRate = 2000; // Slow blink if Bluetooth disabled
   }
   
   if (millis() - ralphLastBlink > ralphBlinkRate) {
@@ -823,12 +1121,43 @@ void ralphSerialEvent() {
       ralphDisplaySensitivitySettings();
     } else if (ralphCommand == "test") {
       ralphRunSensorTest();
+    } else if (ralphCommand == "bluetooth" || ralphCommand == "bt") {
+      ralphDisplayBluetoothStatus();
+    } else if (ralphCommand == "bt on") {
+      ralphBluetoothEnabled = true;
+      Serial.println(F("📡 Bluetooth enabled"));
+    } else if (ralphCommand == "bt off") {
+      ralphBluetoothEnabled = false;
+      Serial.println(F("📡 Bluetooth disabled"));
+    } else if (ralphCommand == "autosend on") {
+      ralphBluetoothAutoSend = true;
+      Serial.println(F("📡 Auto-send enabled"));
+    } else if (ralphCommand == "autosend off") {
+      ralphBluetoothAutoSend = false;
+      Serial.println(F("📡 Auto-send disabled"));
     } else if (ralphCommand == "help") {
       ralphDisplayHelp();
     } else {
       Serial.println(F("❓ Unknown command. Type 'help' for available commands."));
     }
   }
+}
+
+void ralphDisplayBluetoothStatus() {
+  Serial.println(F("\n📡 BLUETOOTH STATUS:"));
+  Serial.print(F("   Module: "));
+  Serial.println(ralphBluetoothEnabled ? F("ENABLED") : F("DISABLED"));
+  Serial.print(F("   Auto-send: "));
+  Serial.println(ralphBluetoothAutoSend ? F("ON") : F("OFF"));
+  Serial.println(F("   Device Name: BAYMAX_Monitor"));
+  Serial.println(F("   PIN: 1234"));
+  Serial.println();
+  
+  if (ralphBluetoothEnabled) {
+    Serial.println(F("   Available via Bluetooth for remote monitoring"));
+    Serial.println(F("   Send 'help' via BT for available commands"));
+  }
+  Serial.println();
 }
 
 void ralphDisplayIRStatus() {
@@ -862,7 +1191,6 @@ void ralphDisplayCO2Status() {
   Serial.print(F("   Total Readings: "));
   Serial.println(ralphieData.ralphTotalCO2Readings);
   
-  // Show buffer contents - importante ang filtering to
   Serial.print(F("   Buffer: ["));
   int ralphCount = ralphieState.ralphCO2BufferFull ? 5 : ralphieState.ralphCO2BufferIndex;
   for (int i = 0; i < ralphCount; i++) {
@@ -888,32 +1216,46 @@ void ralphDisplaySensitivitySettings() {
   Serial.println(IR_LIFE_THRESHOLD);
   Serial.print(F("   IR Human Threshold: "));
   Serial.println(IR_HUMAN_THRESHOLD);
+  Serial.print(F("   Bluetooth Send Interval: "));
+  Serial.print(BLUETOOTH_SEND_INTERVAL / 1000);
+  Serial.println(F(" seconds"));
   Serial.println();
 }
 
 void ralphRunSensorTest() {
-  Serial.println(F("\n🧪 RUNNING SENSOR TEST..."));
+  Serial.println(F("\n RUNNING SENSOR TEST..."));
   Serial.println(F("═══════════════════════════════════"));
   
-  // Test vibration sensor
+  // Test Bluetooth
+  Serial.print(F("📡 Bluetooth: "));
+  if (ralphBluetoothEnabled) {
+    ralphBluetooth.println(F("TEST"));
+    delay(100);
+    if (ralphBluetooth.available()) {
+      Serial.println(F("RESPONDING"));
+      ralphBluetooth.readString(); // Clear buffer
+    } else {
+      Serial.println(F("ENABLED (No response)"));
+    }
+  } else {
+    Serial.println(F("DISABLED"));
+  }
+  
   Serial.print(F("🔴 Vibration Pin ("));
   Serial.print(VIBRATION_PIN);
   Serial.print(F("): "));
   Serial.println(digitalRead(VIBRATION_PIN) ? F("HIGH") : F("LOW"));
   
-  // Test sound sensor
   int ralphSoundValue = analogRead(SOUND_SENSOR_PIN);
   Serial.print(F("🔊 Sound Level: "));
   Serial.print(ralphSoundValue);
   Serial.println(F(" (0-1023)"));
   
-  // Test motion sensor
   Serial.print(F("🚶 Motion Pin ("));
   Serial.print(MOTION_PIN);
   Serial.print(F("): "));
   Serial.println(digitalRead(MOTION_PIN) ? F("HIGH") : F("LOW"));
   
-  // Test ultrasonic sensor
   float ralphDistance = ralphReadUltrasonicDistance();
   Serial.print(F("📏 Distance: "));
   if (ralphDistance > 0) {
@@ -923,7 +1265,6 @@ void ralphRunSensorTest() {
     Serial.println(F("ERROR"));
   }
   
-  // Test infrared sensor
   int ralphIRValue = analogRead(IR_SIGNAL_PIN);
   Serial.print(F("🔥 Infrared Value: "));
   Serial.print(ralphIRValue);
@@ -933,7 +1274,6 @@ void ralphRunSensorTest() {
   Serial.print(abs(ralphIRValue - ralphieState.ralphIRBaseline));
   Serial.println(F(")"));
   
-  // Test CO2 sensor - importante ang test to
   Serial.print(F("🌬️  CO2 Sensor: "));
   ralphSendCO2Command(CO2_CMD_READ);
   delay(100);
@@ -948,6 +1288,8 @@ void ralphRunSensorTest() {
   
   Serial.println(F("═══════════════════════════════════"));
   Serial.println();
+
+  ralphSendBluetoothMessage("SENSOR_TEST", "All sensors tested - check serial output");
 }
 
 void ralphResetCounters() {
@@ -965,8 +1307,7 @@ void ralphResetCounters() {
   ralphieData.ralphMinIRValue = 1023;
   ralphieData.ralphMaxIRValue = 0;
   ralphieState.ralphTotalMotionTime = 0;
-  
-  // Reset ng CO2 buffer ni ralph
+
   for (int i = 0; i < 5; i++) {
     ralphieState.ralphCO2Buffer[i] = 0;
   }
@@ -974,7 +1315,7 @@ void ralphResetCounters() {
   ralphieState.ralphCO2BufferFull = false;
   
   ralphSaveDataToEEPROM();
-  Serial.println(F("All counters and statistics reset"));
+  Serial.println(F("✅ All counters and statistics reset"));
 }
 
 void ralphDisplayHelp() {
@@ -988,7 +1329,13 @@ void ralphDisplayHelp() {
   Serial.println(F("  co2           - Show CO2 sensor status"));
   Serial.println(F("  sensitivity   - Show sensitivity settings"));
   Serial.println(F("  test          - Run complete sensor test"));
+  Serial.println(F("  bluetooth/bt  - Show Bluetooth status"));
+  Serial.println(F("  bt on/off     - Enable/disable Bluetooth"));
+  Serial.println(F("  autosend on/off - Toggle auto data sending"));
   Serial.println(F("  help          - Show this help menu"));
   Serial.println(F("═══════════════════════════════════════"));
+  Serial.println(F("\nBLUETOOTH COMMANDS (send via BT):"));
+  Serial.println(F("  All above commands work via Bluetooth"));
+  Serial.println(F("  plus: ping, data"));
   Serial.println();
 }
